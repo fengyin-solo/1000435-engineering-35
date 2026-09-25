@@ -34,6 +34,30 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 健康检查：`curl http://127.0.0.1:8000/api/health`
 
+### 启动自检（推荐先跑一遍）
+
+```bash
+scripts/dev-check.sh        # 或 make check
+SKIP_FRONTEND=1 scripts/dev-check.sh   # 只检后端接口
+```
+
+脚本会在临时端口（默认 8011，可用 `CHECK_PORT` 覆盖）拉起后端，用内置示例数据
+把达标审核的三段流程与边界场景跑一遍（共 30+ 项断言），再做前端类型检查与构建，
+结束后自动关闭临时服务：
+
+1. 无超标记录：登记 → 开始审核 → 确认通过；
+2. 有超标记录：登记 → 开始审核 → 确认通过被拦（说明先整改）→ 下发整改 → 重复下发被拦；
+3. 导出清单：`GET /api/audit/export` 正常返回，空过滤条件返回空清单并附说明。
+
+边界说明（空数据、超标次数、重复下发）：
+
+- **空数据**：列表接口始终返回 `{items: [], total: 0}` 空页，不报错；
+  导出接口在空结果时额外带 `message` 说明当前过滤条件下没有记录。
+- **超标次数**：为空、缺失或非数字时按 0 处理（列表、详情、统计同口径）；
+  超标次数大于 0 时不能「确认通过」，必须先「下发整改」；为 0 时不能下发整改。
+- **重复下发**：「需整改」是终态，再次「下发整改」会被状态机拦下并说明，
+  「已通过」同理；「开始审核」也不能重复执行。
+
 ### 前端
 
 ```bash
@@ -74,3 +98,10 @@ npm run dev
   `backend/app/routers/<模块>.py`，业务规则在 `backend/app/services/<模块>.py`。
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
+- 达标审核的状态、动作与流转条件只有一份定义：
+  `backend/app/services/audit_machine.py`。前端不自己维护动作与状态清单，
+  统一从 `GET /api/audit/state-machine` 取定义、按每条记录返回的 `actions[]`
+  （含 `enabled` 与不可点 `reason`）渲染按钮，保证同一审核编号两边永远同步。
+- 列表与详情共用同一序列化出口（`serialize_entry`），两条路径返回字段完全一致。
+- `/export`、`/state-machine`、`/stats` 等字面量路由必须声明在 `/{entry_id}`
+  之前，否则路径参数会把它们当成审核编号解析而返回 422。
