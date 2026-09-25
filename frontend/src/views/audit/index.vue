@@ -19,9 +19,16 @@
     </div>
 
     <form class="filter-bar" @submit.prevent="reload">
-      <label v-for="field in filterFields" :key="field" class="filter-item">
-        <span>{{ field }}</span>
-        <input v-model="filters[field]" :placeholder="`按${field}检索`" />
+      <label class="filter-item">
+        <span>审核编号</span>
+        <input v-model="keyword" placeholder="按审核编号检索" />
+      </label>
+      <label class="filter-item">
+        <span>审核状态</span>
+        <select v-model="statusFilter">
+          <option value="">全部状态</option>
+          <option v-for="status in meta.statuses" :key="status" :value="status">{{ status }}</option>
+        </select>
       </label>
       <button class="btn" type="submit">查询</button>
       <button class="btn ghost" type="button" @click="resetFilters">重置条件</button>
@@ -38,19 +45,25 @@
         <tr v-for="row in rows" :key="String(row.id)">
           <td v-for="column in columns" :key="column">{{ row[column] ?? '—' }}</td>
           <td class="row-actions">
-            <button
-              v-for="action in actions"
-              :key="action"
-              class="link"
-              type="button"
-              @click="runAction(action, row)"
-            >
-              {{ action }}
-            </button>
+            <template v-if="rowActions(row).length">
+              <button
+                v-for="action in rowActions(row)"
+                :key="action"
+                class="link"
+                type="button"
+                :title="actionHint(action, row)"
+                @click="runAction(action, row)"
+              >
+                {{ action }}
+              </button>
+            </template>
+            <span v-else class="muted-text">{{ terminalHint(row) }}</span>
           </td>
         </tr>
         <tr v-if="!rows.length">
-          <td :colspan="columns.length + 1" class="empty-state">暂无达标审核数据，可先登记审核记录</td>
+          <td :colspan="columns.length + 1" class="empty-state">
+            暂无达标审核数据：可先登记审核记录；若由筛选导致，请清空查询条件后重试
+          </td>
         </tr>
       </tbody>
     </table>
@@ -63,35 +76,86 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 
 import { request } from '@/api/client'
 
-type Row = Record<string, string | number | null>
+type Row = {
+  id: number
+  审核状态: string
+  超标次数: number
+  整改项数: number
+  可执行动作: string[]
+  [key: string]: string | number | string[] | null
+}
+
+type Meta = {
+  statuses: string[]
+  guard_hints: Record<string, string>
+  terminal_hints: Record<string, string>
+}
 
 const ENDPOINT = '/api/audit'
-const columns = ["审核编号", "审核周期", "审核范围", "超标次数", "整改项数", "审核结论", "审核人员", "审核状态"]
-const actions = ["开始审核", "确认通过", "下发整改"]
-const statuses = ["待审核", "审核中", "已通过", "需整改"]
-const stats = [{"label": "待审核记录", "value": 0}, {"label": "超标总次数", "value": 0}, {"label": "需整改项数", "value": 0}]
+// 展示列保持既有入口不变；动作与状态清单不在前端维护，统一取后端 /meta。
+const columns = ['审核编号', '审核周期', '审核范围', '超标次数', '整改项数', '审核结论', '审核人员', '审核状态']
 
 const rows = ref<Row[]>([])
 const total = ref(0)
 const errorMessage = ref('')
-const filters = ref<Record<string, string>>({})
-const filterFields = columns.slice(0, 3)
+const keyword = ref('')
+const statusFilter = ref('')
+const meta = ref<Meta>({ statuses: [], guard_hints: {}, terminal_hints: {} })
+
+const stats = computed(() => {
+  const pending = rows.value.filter((row) => row.审核状态 === '待审核').length
+  const exceedTotal = rows.value.reduce((sum, row) => sum + (Number(row.超标次数) || 0), 0)
+  const rectifyItems = rows.value.reduce((sum, row) => sum + (Number(row.整改项数) || 0), 0)
+  return [
+    { label: '待审核记录', value: pending },
+    { label: '超标总次数', value: exceedTotal },
+    { label: '需整改项数', value: rectifyItems },
+  ]
+})
+
+function rowActions(row: Row): string[] {
+  return Array.isArray(row.可执行动作) ? row.可执行动作 : []
+}
+
+function actionHint(action: string, row: Row): string {
+  if (action === '确认通过' && Number(row.超标次数) > 0) {
+    return meta.value.guard_hints['确认通过'] ?? ''
+  }
+  return ''
+}
+
+function terminalHint(row: Row): string {
+  return meta.value.terminal_hints[row.审核状态] ?? '当前状态暂无可执行动作'
+}
 
 function resetFilters() {
-  filters.value = {}
+  keyword.value = ''
+  statusFilter.value = ''
   void reload()
 }
 
 function exportRows() {
-  window.open(`${ENDPOINT}/export`, '_blank')
+  const query = new URLSearchParams()
+  if (keyword.value) query.set('keyword', keyword.value)
+  if (statusFilter.value) query.set('status', statusFilter.value)
+  const suffix = query.toString()
+  window.open(`${ENDPOINT}/export${suffix ? `?${suffix}` : ''}`, '_blank')
 }
 
 function openCreate() {
   errorMessage.value = '审核记录登记入口尚未接入审批流'
+}
+
+async function loadMeta() {
+  const response = await request(`${ENDPOINT}/meta`)
+  if (!response.ok) {
+    throw new Error('状态机配置读取失败，请确认后端服务版本')
+  }
+  meta.value = await response.json()
 }
 
 async function runAction(action: string, row: Row) {
@@ -101,8 +165,9 @@ async function runAction(action: string, row: Row) {
       method: 'POST',
       body: JSON.stringify({ action }),
     })
-    if (!response.ok) {
-      throw new Error('达标审核动作未生效，请稍后重试')
+    const payload = await response.json().catch(() => null)
+    if (!response.ok || !payload?.ok) {
+      throw new Error(payload?.message ?? '达标审核动作未生效，请稍后重试')
     }
     await reload()
   } catch (error) {
@@ -112,9 +177,11 @@ async function runAction(action: string, row: Row) {
 
 async function reload() {
   errorMessage.value = ''
-  const query = new URLSearchParams(filters.value as Record<string, string>).toString()
+  const query = new URLSearchParams()
+  if (keyword.value.trim()) query.set('keyword', keyword.value.trim())
+  if (statusFilter.value) query.set('status', statusFilter.value)
   try {
-    const response = await request(`${ENDPOINT}?${query}`)
+    const response = await request(`${ENDPOINT}?${query.toString()}`)
     if (!response.ok) {
       throw new Error('审核记录列表读取失败')
     }
@@ -126,5 +193,12 @@ async function reload() {
   }
 }
 
-onMounted(reload)
+onMounted(async () => {
+  try {
+    await loadMeta()
+    await reload()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '达标审核页面初始化失败'
+  }
+})
 </script>
